@@ -140,6 +140,19 @@ def visualize_and_optimize(G, dynamic_weights, start_coords, end_coords, route_t
         optimized_route = None
         optimized_cost = 0
 
+    # Mark edges belonging to the optimized path so we can draw them on top (robust for MultiDiGraph)
+    optimized_edges = set()
+    if optimized_route:
+        for i in range(len(optimized_route) - 1):
+            u = optimized_route[i]
+            v = optimized_route[i + 1]
+            # get_edge_data may return None; handle safely for MultiDiGraph
+            edge_dict = G.get_edge_data(u, v) or {}
+            if not isinstance(edge_dict, dict):
+                continue
+            for k in edge_dict.keys():
+                optimized_edges.add((u, v, k))
+
     # Center map on route midpoint if available, otherwise use CENTER_POINT
     if optimized_route:
         mid_idx = len(optimized_route) // 2
@@ -168,6 +181,9 @@ def visualize_and_optimize(G, dynamic_weights, start_coords, end_coords, route_t
 
     # Draw traffic-colored edges and optimized route (existing logic)
     for u, v, k, data in G.edges(keys=True, data=True):
+        # skip edges that are part of the optimized route; we'll draw them thicker and blue later
+        if (u, v, k) in optimized_edges:
+            continue
         u_node = G.nodes[u]
         v_node = G.nodes[v]
         factor = data.get('congestion_factor', 0.0)
@@ -179,7 +195,7 @@ def visualize_and_optimize(G, dynamic_weights, start_coords, end_coords, route_t
             opacity=0.9,
             tooltip=f"Predicted Congestion: {factor:.2f} | Cost: {data.get('dynamic_weight', 0.0):.2f} m"
         ).add_to(m)
-
+ 
     if optimized_route:
         route_coords = [(G.nodes[node]['y'], G.nodes[node]['x']) for node in optimized_route]
         folium.PolyLine(route_coords, color='blue', weight=5, opacity=1.0,

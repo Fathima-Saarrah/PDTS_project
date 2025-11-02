@@ -210,7 +210,11 @@ def visualize_and_optimize(G, dynamic_weights, start_coords, end_coords, route_t
         center_loc = CENTER_POINT
 
     # Create base map after computing route so it's centered correctly
-    m = folium.Map(location=center_loc, zoom_start=14, tiles="cartodbpositron")
+    m = folium.Map(location=center_loc, zoom_start=14, tiles="cartodbpositron", control_scale=True)
+    
+    # Add distance scale and fullscreen control
+    folium.plugins.Fullscreen().add_to(m)
+    folium.plugins.MeasureControl(position='bottomleft', primary_length_unit='kilometers').add_to(m)
 
     # Start / End markers (use provided labels if available)
     try:
@@ -272,12 +276,303 @@ def visualize_and_optimize(G, dynamic_weights, start_coords, end_coords, route_t
 
     # Calculate detailed route metrics and travel time
     try:
-        shortest_cost = nx.shortest_path_length(G, start_node, end_node, weight='length')
-        ai_cost = nx.shortest_path_length(G, start_node, end_node, weight='dynamic_weight')
-        st.metric("Shortest Path Cost (length)", f"{shortest_cost:.2f} m")
-        st.metric("AI-Optimized Cost (dynamic)", f"{ai_cost:.2f} m")
-    except Exception:
-        pass
+        # Get actual route distances
+        shortest_distance = nx.shortest_path_length(G, start_node, end_node, weight='length')
+        ai_distance = sum(G.edges[u, v, 0]['length'] for u, v in zip(optimized_route[:-1], optimized_route[1:]))
+        aerial_distance = euclidean_dist(start_coords[0], start_coords[1], end_coords[0], end_coords[1])
+
+        # Calculate segment-wise details
+        segment_details = []
+        total_time_mins = 0
+        road_type_distances = {}
+        cumulative_distance = 0
+        
+        for i in range(len(optimized_route)-1):
+            u, v = optimized_route[i], optimized_route[i+1]
+            edge_data = G.edges[u, v, 0]
+            distance = edge_data['length']
+            road_type = edge_data.get('highway', 'unknown')
+            congestion = edge_data.get('congestion_factor', 0.0)
+            
+            # Estimate speed based on road type and congestion
+            base_speed = {
+                'motorway': 80, 'trunk': 60, 'primary': 50,
+                'secondary': 40, 'tertiary': 30, 'residential': 25
+            }.get(road_type, 35)  # km/h
+            
+            # Adjust speed based on congestion
+            if congestion >= 0.8:
+                speed = base_speed * 0.3  # Severe congestion
+            elif congestion >= 0.6:
+                speed = base_speed * 0.5  # Heavy congestion
+            elif congestion >= 0.4:
+                speed = base_speed * 0.7  # Moderate congestion
+            else:
+                speed = base_speed * 0.9  # Light/no congestion
+            
+            # Calculate time for segment
+            time_hours = (distance / 1000) / speed
+            time_mins = time_hours * 60
+            total_time_mins += time_mins
+            
+            # Track distance by road type
+            road_type_distances[road_type] = road_type_distances.get(road_type, 0) + distance
+            
+            cumulative_distance += distance
+            segment_details.append({
+                'distance': distance,
+                'road_type': road_type,
+                'congestion': congestion,
+                'time_mins': time_mins,
+                'cumulative_distance': cumulative_distance
+            })
+        
+        # After computing segments, add detailed route popup and km markers to the map
+        try:
+            # Build HTML summary for the route popup
+            route_html = f"""
+            <div style='font-size:12px;width:220px'>
+              <h4>Route Summary</h4>
+              <b>Total Distance:</b> {ai_distance/1000:.2f} km<br>
+              <b>Est. Time:</b> {int(total_time_mins//60)}h {int(total_time_mins%60)}m<br>
+              <b>Avg Speed:</b> {(ai_distance/1000)/(total_time_mins/60):.1f} km/h<br>
+              <b>Route Type:</b> {route_type}<br>
+              <hr>
+              <b>Traffic Conditions:</b><br>
+              🔴 Heavy: {sum(1 for s in segment_details if s['congestion'] >= 0.6)}<br>
+              🟡 Medium: {sum(1 for s in segment_details if 0.3 <= s['congestion'] < 0.6)}<br>
+              🟢 Low: {sum(1 for s in segment_details if s['congestion'] < 0.3)}
+            </div>
+            """
+
+            # Attach popup to the blue route (add a new polyline with popup)
+            folium.PolyLine(
+                route_coords,
+                color='blue',
+                weight=5,
+                opacity=1.0,
+                popup=folium.Popup(route_html, max_width=300),
+                tooltip=f"Click for route details"
+            ).add_to(m)
+
+            # Add kilometer markers along the route using cumulative_distance
+            total_km = int(ai_distance // 1000)
+            if total_km >= 1:
+                for km_mark in range(1, total_km + 1):
+                    # find the first segment where cumulative_distance >= km_mark*1000
+                    marker_latlon = None
+                    for seg in segment_details:
+                        if seg['cumulative_distance'] >= km_mark * 1000:
+                            # approximate marker position using proportional index on route_coords
+                            frac = seg['cumulative_distance'] / ai_distance if ai_distance > 0 else 0
+                            idx = min(int(len(route_coords) * frac), len(route_coords) - 1)
+                            marker_latlon = route_coords[idx]
+                            break
+                    if marker_latlon:
+                        folium.CircleMarker(
+                            location=marker_latlon,
+                            radius=4,
+                            color="black",
+                            fill=True,
+                            fill_color="white",
+                            popup=f"{km_mark} km",
+                            tooltip=f"{km_mark} km",
+                        ).add_to(m)
+        except Exception:
+            # If adding popup/markers fails, ignore and continue
+            pass
+        
+        # Show primary metrics in columns
+        dist_col1, dist_col2, dist_col3 = st.columns(3)
+        with dist_col1:
+            st.metric("Total Distance", f"{ai_distance/1000:.2f} km", 
+                     delta=f"{((ai_distance-shortest_distance)/shortest_distance)*100:.1f}% vs shortest",
+                     help="Actual distance along the selected route")
+        with dist_col2:
+            st.metric("Estimated Travel Time", 
+                     f"{int(total_time_mins//60)}h {int(total_time_mins%60)}min",
+                     help="Based on road types and current congestion")
+        with dist_col3:
+            avg_speed = (ai_distance/1000)/(total_time_mins/60)
+            st.metric("Average Speed", f"{avg_speed:.1f} km/h",
+                     help="Average travel speed considering traffic")
+        
+        # Show detailed breakdown with tabs
+        tab1, tab2, tab3, tab4 = st.tabs(["Route Analysis", "Speed Profile", "Alternative Routes", "Time Estimates"])
+        
+        with tab1:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write("**Distance by Road Type:**")
+                for road_type, distance in road_type_distances.items():
+                    st.write(f"- {road_type.title()}: {distance/1000:.2f} km ({(distance/ai_distance)*100:.1f}%)")
+            
+            with col2:
+                st.write("**Journey Analysis:**")
+                st.write(f"- Direct (aerial) distance: {aerial_distance/1000:.2f} km")
+                st.write(f"- Route efficiency: {(aerial_distance/ai_distance)*100:.1f}%")
+                st.write(f"- Number of segments: {len(segment_details)}")
+                
+                # Calculate congestion distribution
+                high_cong = sum(1 for s in segment_details if s['congestion'] >= 0.6)
+                med_cong = sum(1 for s in segment_details if 0.3 <= s['congestion'] < 0.6)
+                low_cong = sum(1 for s in segment_details if s['congestion'] < 0.3)
+                st.write(f"- High congestion segments: {high_cong}")
+                st.write(f"- Medium congestion segments: {med_cong}")
+                st.write(f"- Low congestion segments: {low_cong}")
+        
+        with tab2:
+            # Create speed and congestion profile charts
+            import plotly.graph_objects as go
+            from plotly.subplots import make_subplots
+            
+            # Prepare data for the profile charts
+            distances = [0]
+            speeds = []
+            congestions = []
+            cum_dist = 0
+            
+            for seg in segment_details:
+                cum_dist += seg['distance']
+                distances.append(cum_dist/1000)  # Convert to km
+                
+                # Calculate speed for this segment
+                base_speed = {
+                    'motorway': 80, 'trunk': 60, 'primary': 50,
+                    'secondary': 40, 'tertiary': 30, 'residential': 25
+                }.get(seg['road_type'], 35)
+                
+                # Apply congestion factor
+                if seg['congestion'] >= 0.8:
+                    speed = base_speed * 0.3
+                elif seg['congestion'] >= 0.6:
+                    speed = base_speed * 0.5
+                elif seg['congestion'] >= 0.4:
+                    speed = base_speed * 0.7
+                else:
+                    speed = base_speed * 0.9
+                    
+                speeds.append(speed)
+                congestions.append(seg['congestion'])
+            
+            # Create subplot figure
+            fig = make_subplots(rows=2, cols=1, subplot_titles=('Speed Profile', 'Congestion Level'))
+            
+            # Add speed profile
+            fig.add_trace(
+                go.Scatter(x=distances, y=speeds, mode='lines', name='Speed (km/h)',
+                          line=dict(color='blue')),
+                row=1, col=1
+            )
+            
+            # Add congestion profile
+            fig.add_trace(
+                go.Scatter(x=distances, y=congestions, mode='lines', name='Congestion',
+                          line=dict(color='red')),
+                row=2, col=1
+            )
+            
+            fig.update_layout(height=500, title_text="Route Profiles")
+            fig.update_xaxes(title_text="Distance (km)")
+            fig.update_yaxes(title_text="Speed (km/h)", row=1, col=1)
+            fig.update_yaxes(title_text="Congestion Factor", row=2, col=1)
+            
+            st.plotly_chart(fig, use_container_width=True)
+        
+        with tab3:
+            # Calculate and show alternative routes
+            st.write("**Alternative Routes Comparison:**")
+            
+            # Get three different routes: shortest, fastest, and balanced
+            routes = {
+                "Current Route": optimized_route,
+                "Shortest Distance": nx.shortest_path(G, start_node, end_node, weight='length'),
+                "Least Congestion": nx.shortest_path(G, start_node, end_node, 
+                                                   weight=lambda u, v, d: d[0].get('length', 1) * (1 + d[0].get('congestion_factor', 0)))
+            }
+            
+            route_metrics = []
+            for route_name, route in routes.items():
+                distance = sum(G.edges[u, v, 0]['length'] for u, v in zip(route[:-1], route[1:]))
+                congestion = np.mean([G.edges[u, v, 0].get('congestion_factor', 0) for u, v in zip(route[:-1], route[1:])])
+                time = sum((G.edges[u, v, 0]['length']/1000) / 
+                         (40 * (1 - 0.7*G.edges[u, v, 0].get('congestion_factor', 0))) 
+                         for u, v in zip(route[:-1], route[1:]))
+                
+                route_metrics.append({
+                    "Route": route_name,
+                    "Distance (km)": f"{distance/1000:.2f}",
+                    "Avg Congestion": f"{congestion:.2f}",
+                    "Est. Time": f"{int(time*60//60)}h {int(time*60%60)}m"
+                })
+            
+            import pandas as pd
+            st.table(pd.DataFrame(route_metrics))
+        
+        with tab4:
+            # Show time estimates for different hours
+            st.write("**Estimated Travel Times by Hour:**")
+            
+            hours = list(range(24))
+            times = []
+            
+            for hour in hours:
+                # Adjust congestion based on time of day
+                if 8 <= hour <= 10 or 17 <= hour <= 19:  # Peak hours
+                    factor = 1.5
+                elif 0 <= hour <= 5:  # Night hours
+                    factor = 0.5
+                else:  # Normal hours
+                    factor = 1.0
+                
+                # Calculate estimated time for this hour
+                time = total_time_mins * factor
+                times.append(time)
+            
+            # Create time estimation chart
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=hours,
+                y=times,
+                mode='lines+markers',
+                name='Travel Time',
+                hovertemplate='Hour: %{x}:00<br>Time: %{text}<extra></extra>',
+                text=[f"{int(t//60)}h {int(t%60)}m" for t in times]
+            ))
+            
+            fig.update_layout(
+                title="Travel Time by Hour of Day",
+                xaxis_title="Hour",
+                yaxis_title="Minutes",
+                hovermode='x'
+            )
+            fig.update_xaxes(ticktext=[f"{h:02d}:00" for h in hours], tickvals=hours)
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+        
+        
+        
+        # Add route distance popup to the blue route line
+        if optimized_route:
+            route_popup = f"""
+            <div style='font-size:12px'>
+            <b>Route Details:</b><br>
+            Distance: {ai_distance/1000:.2f} km<br>
+            Type: {route_type}<br>
+            </div>
+            """
+            folium.PolyLine(
+                route_coords,
+                color='blue',
+                weight=5,
+                opacity=1.0,
+                popup=route_popup,
+                tooltip=f"{route_type} Route: {ai_distance/1000:.2f} km"
+            ).add_to(m)
+            
+    except Exception as e:
+        st.warning(f"Could not calculate some distance metrics: {str(e)}")
 
     return m
 
